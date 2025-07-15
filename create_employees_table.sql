@@ -11,5 +11,5 @@ CREATE TABLE employees (
     department_id INT
 );
 
---- Optional: Create index on department_id
+-- Optional: Create index on department_id
 CREATE INDEX idx_department_id ON employees(department_id);
