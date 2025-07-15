@@ -1,0 +1,39 @@
+name: Upload SQL to GCS
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: quick-platform-466015-d5
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Upload SQL file to GCS
+        run: |
+          SQL_FILE=$(find . -name "*.sql" | head -n 1)
+
+          if [ -z "$SQL_FILE" ]; then
+            echo "❌ No SQL file found!"
+            exit 1
+          fi
+
+          echo "✅ Found SQL file: $SQL_FILE"
+          
+          gsutil cp "$SQL_FILE" "gs://test-git-actions/$(basename $SQL_FILE)"
+
+      - name: Keep only last 5 versions
+        run: |
+          OBJECT=$(basename "$SQL_FILE")
+          echo "Keeping last 5 versions of $OBJECT in GCS..."
+          gsutil ls -a "gs://test-git-actions/$OBJECT" | sort -r | tail -n +6 | xargs -r gsutil rm
