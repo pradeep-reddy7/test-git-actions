@@ -3,7 +3,7 @@ name: Upload SQL to GCS
 on:
   push:
     branches:
-      - master
+      - main
 
 jobs:
   upload:
