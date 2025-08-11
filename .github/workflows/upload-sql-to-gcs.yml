@@ -16,7 +16,7 @@ jobs:
     env:
       PROJECT_ID: quick-platform-466015-d5
       GCS_BUCKET: gs://test-git-actions
-      REPO_NAME: marketing   # used only under dags/: gs://bucket/dags/marketing/<subrepo>/**
+      REPO_NAME: marketing   # gs://bucket/dags/marketing/<subrepo>/**
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
           install_components: gsutil
 
-      - name: Mirror to GCS (delete extras)
+      - name: Mirror to GCS (deep delete + deep hygiene)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -52,7 +52,7 @@ jobs:
             echo "::warning::Cannot stat bucket ${base} (missing or no permission). Continuing..."
           fi
 
-          # ---------- Detect where your subrepos live ----------
+          # ---------- Detect FS root (repo root or marketing/) ----------
           FS_ROOT="."
           if [[ -d "marketing" ]] && find "marketing" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
             FS_ROOT="marketing"
@@ -73,10 +73,6 @@ jobs:
             fi
           done < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
 
-          # One-time nukes of prior mistakes
-          gsutil -m rm -r "${BUCKET}/marketing" 2>/dev/null || true
-          gsutil -m rm -r "${BUCKET}/Marketing" 2>/dev/null || true
-
           # ---------- Optional repo-level config/ ----------
           if [[ -d "config" ]]; then
             gsutil -m rsync -d -r "config" "${CONFIG_ROOT}"
@@ -94,10 +90,10 @@ jobs:
           echo "Found subrepos: ${subrepos[*]:-<none>}"
           [[ ${#subrepos[@]} -gt 0 ]] || { echo "Nothing to sync."; exit 0; }
 
-          # Helper to get a path under FS_ROOT
+          # helper for FS_ROOT-relative paths
           path_under_fsroot() { echo "${FS_ROOT%/}/$1"; }
 
-          # ---------- 1) Mirror DAGs: <FS_ROOT>/<sub>/dags/** -> gs://.../dags/${REPO_NAME}/<sub>/** ----------
+          # ---------- 1) Mirror DAGs ----------
           for sub in "${subrepos[@]}"; do
             src="$(path_under_fsroot "$sub")/dags"
             dst="${DAGS_ROOT}/${sub}"
@@ -107,6 +103,7 @@ jobs:
               gsutil -m rm -r "$dst" 2>/dev/null || true
             fi
           done
+
           # Prune stale DAG subrepos (anything not in Git)
           while IFS= read -r gcs_path; do
             [[ -z "$gcs_path" ]] && continue
@@ -115,12 +112,26 @@ jobs:
             if [[ "$keep" == false ]]; then gsutil -m rm -r "$gcs_path" || true; fi
           done < <(gsutil ls -d "${DAGS_ROOT}/*" 2>/dev/null || true)
 
-          # ---------- 2) Mirror DATA (deep delete): all NON-dags content ----------
+          # DEEP hygiene in dags/: allow only dags/${REPO_NAME}/** (and dags/.gcskeep)
+          while IFS= read -r uri; do
+            [[ -z "$uri" ]] && continue
+            # keep keeper file
+            [[ "$uri" == "${BUCKET}/dags/.gcskeep" ]] && continue
+            case "$uri" in
+              "${DAGS_ROOT}/"* ) : ;;   # allowed
+              * )
+                echo "Deleting stray under dags/: $uri"
+                gsutil -m rm -r "$uri" || true
+                ;;
+            esac
+          done < <(gsutil ls -r "${BUCKET}/dags/**" 2>/dev/null || true)
+
+          # ---------- 2) Mirror DATA (deep delete for all non-dags) ----------
           for sub in "${subrepos[@]}"; do
-            # mirror the whole subrepo excluding its dags/ folder
             gsutil -m rsync -d -r -x '(^|/)dags(/|$)' "$(path_under_fsroot "$sub")" "${DATA_ROOT}/${sub}/"
           done
-          # Prune stale DATA subrepos
+
+          # Prune stale DATA subrepos (anything not in Git)
           while IFS= read -r gpath; do
             [[ -z "$gpath" ]] && continue
             gsub="${gpath%/}"; gsub="${gsub##*/}"
@@ -128,10 +139,21 @@ jobs:
             if [[ "$keep" == false ]]; then gsutil -m rm -r "$gpath" || true; fi
           done < <(gsutil ls -d "${DATA_ROOT}/*" 2>/dev/null || true)
 
-          # Extra safety: if someone created data/marketing/ by mistake, remove it (marketing is not a subrepo)
-          if [[ ! " ${subrepos[*]} " =~ [[:space:]]marketing[[:space:]] ]]; then
-            gsutil -m rm -r "${DATA_ROOT}/marketing" 2>/dev/null || true
-          fi
+          # DEEP hygiene in data/: allow only data/<subrepo>/** for current subrepos (and data/.gcskeep)
+          while IFS= read -r uri; do
+            [[ -z "$uri" ]] && continue
+            [[ "$uri" == "${BUCKET}/data/.gcskeep" ]] && continue
+            keep=false
+            for sub in "${subrepos[@]}"; do
+              case "$uri" in
+                "${DATA_ROOT}/${sub}/"* ) keep=true; break ;;
+              esac
+            done
+            if [[ "$keep" == false ]]; then
+              echo "Deleting stray under data/: $uri"
+              gsutil -m rm -r "$uri" || true
+            fi
+          done < <(gsutil ls -r "${BUCKET}/data/**" 2>/dev/null || true)
 
           set +x
           echo "Final listing:"
