@@ -16,7 +16,7 @@ jobs:
     env:
       PROJECT_ID: quick-platform-466015-d5
       GCS_BUCKET: gs://test-git-actions
-      REPO_NAME: marketing   # DAGS -> gs://bucket/dags/marketing/<subrepo>; DATA -> gs://bucket/data/marketing/<subrepo>
+      REPO_NAME: marketing   # DAGS -> gs://bucket/dags/marketing/<sub>; DATA -> gs://bucket/data/marketing/<sub>
 
     steps:
       - uses: actions/checkout@v4
@@ -43,10 +43,10 @@ jobs:
 
           BUCKET="${GCS_BUCKET%/}"
           DAGS_ROOT="${BUCKET}/dags/${REPO_NAME}"
-          DATA_ROOT="${BUCKET}/data/${REPO_NAME}"   # <<<<<< changed
+          DATA_ROOT="${BUCKET}/data/${REPO_NAME}"
           CONFIG_ROOT="${BUCKET}/config"
 
-          # Detect where subrepos live: repo root or marketing/
+          # Detect subrepos live at repo root or under marketing/
           FS_ROOT="."
           if [[ -d "marketing" ]] && find "marketing" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
             FS_ROOT="marketing"
@@ -54,4 +54,70 @@ jobs:
           echo "FS_ROOT=${FS_ROOT}"
 
           # Ensure mandatory top-level dirs exist
-          echo | gsutil cp - "${BUCKET}/dags/.gcskee
+          echo | gsutil cp - "${BUCKET}/dags/.gcskeep" >/dev/null 2>&1 || true
+          echo | gsutil cp - "${BUCKET}/data/.gcskeep" >/dev/null 2>&1 || true
+          echo | gsutil cp - "${DATA_ROOT}/.gcskeep"   >/dev/null 2>&1 || true
+
+          # Root hygiene: keep ONLY dags/, data/, config/ at bucket root
+          while IFS= read -r top; do
+            [[ -z "$top" ]] && continue
+            base="${top%/}"; base="${base##*/}"
+            if [[ "$base" != "dags" && "$base" != "data" && "$base" != "config" ]]; then
+              gsutil -m rm -r "$top" || true
+            fi
+          done < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
+
+          # Optional repo-level config/
+          if [[ -d "config" ]]; then
+            gsutil -m rsync -d -r "config" "${CONFIG_ROOT}"
+          else
+            gsutil -m rm -r "${CONFIG_ROOT}" 2>/dev/null || true
+          fi
+
+          # Gather subrepos under FS_ROOT
+          mapfile -t subrepos < <(find "$FS_ROOT" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | grep -vE '^(\.git|\.github|config|\.)$' | sort)
+          echo "Subrepos: ${subrepos[*]:-<none>}"
+          [[ ${#subrepos[@]} -gt 0 ]] || { echo "Nothing to sync."; exit 0; }
+
+          # Helper for FS_ROOT-relative paths
+          src_path() { echo "${FS_ROOT%/}/$1"; }
+
+          # ========== DAGS: hard delete then copy ==========
+          for sub in "${subrepos[@]}"; do
+            src="$(src_path "$sub")/dags"
+            dst="${DAGS_ROOT}/${sub}"
+            gsutil -m rm -r "${dst}" 2>/dev/null || true
+            if [[ -d "$src" ]]; then
+              gsutil -m rsync -r "$src" "$dst"
+            else
+              echo "No DAGs for $sub (left deleted)."
+            fi
+          done
+          # prune any stale DAG subrepos
+          while IFS= read -r g; do
+            [[ -z "$g" ]] && continue
+            base="${g%/}"; base="${base##*/}"
+            keep=false; for s in "${subrepos[@]}"; do [[ "$s" == "$base" ]] && keep=true && break; done
+            if [[ "$keep" == false ]]; then gsutil -m rm -r "$g" || true; fi
+          done < <(gsutil ls -d "${DAGS_ROOT}/*" 2>/dev/null || true)
+
+          # ========== DATA: hard delete then copy everything EXCEPT dags ==========
+          for sub in "${subrepos[@]}"; do
+            src="$(src_path "$sub")"
+            dst="${DATA_ROOT}/${sub}/"
+            gsutil -m rm -r "${dst}" 2>/dev/null || true
+            gsutil -m rsync -r -x '(^|/)dags(/|$)' "$src" "$dst"
+          done
+          # prune any stale DATA subrepos
+          while IFS= read -r g; do
+            [[ -z "$g" ]] && continue
+            base="${g%/}"; base="${base##*/}"
+            keep=false; for s in "${subrepos[@]}"; do [[ "$s" == "$base" ]] && keep=true && break; done
+            if [[ "$keep" == false ]]; then gsutil -m rm -r "$g" || true; fi
+          done < <(gsutil ls -d "${DATA_ROOT}/*" 2>/dev/null || true)
+
+          set +x
+          echo "Final listing:"
+          gsutil ls -r "${BUCKET}/dags/" || true
+          gsutil ls -r "${BUCKET}/data/" || true
+          echo "✅ Hard mirror complete (data/marketing/<subrepo> ✔)."
