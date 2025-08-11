@@ -35,7 +35,7 @@ jobs:
 
       - name: Quick repo view (debug)
         run: |
-          echo "Repo top-level folders:"
+          echo "Repo top-level:"
           find . -maxdepth 2 -type d -printf "%P\n" | sed 's#^$#.#/' | sort
 
       - name: Mirror to GCS (delete extras)
@@ -44,7 +44,6 @@ jobs:
           set -Eeuo pipefail
           set -x
           trap 'echo "::error::Failed at line $LINENO: $BASH_COMMAND"' ERR
-
           shopt -s nullglob
 
           BUCKET="${GCS_BUCKET%/}"
@@ -54,14 +53,18 @@ jobs:
 
           echo "Bucket root: ${BUCKET}"
           base="${BUCKET#gs://}"; base="gs://${base%%/*}"
-          gsutil ls -b "${base}" >/dev/null
 
-          # --- Ensure mandatory top-level dirs exist ---
+          # Make the bucket existence/permission check NON-FATAL
+          if ! gsutil ls -b "${base}" >/dev/null 2>&1; then
+            echo "::warning::Cannot stat bucket ${base} (missing or no permission). Continuing..."
+          fi
+
+          # --- Ensure mandatory top-level dirs exist (best effort) ---
           echo | gsutil cp - "${BUCKET}/dags/.gcskeep" >/dev/null 2>&1 || true
           echo | gsutil cp - "${BUCKET}/data/.gcskeep" >/dev/null 2>&1 || true
 
           # --- Root hygiene: keep ONLY dags/, data/, config/ at bucket root ---
-          echo "Root hygiene: pruning unexpected top-level prefixes under ${BUCKET} ..."
+          echo "Root hygiene under ${BUCKET} ..."
           while IFS= read -r top; do
             [[ -z "$top" ]] && continue
             base_name="${top%/}"; base_name="${base_name##*/}"
@@ -71,7 +74,7 @@ jobs:
             fi
           done < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
 
-          # Extra one-time nuke of old leftovers named marketing/ or Marketing/ at root
+          # One-time nuke of historic leftovers
           gsutil -m rm -r "${BUCKET}/marketing" 2>/dev/null || true
           gsutil -m rm -r "${BUCKET}/Marketing" 2>/dev/null || true
 
@@ -160,7 +163,7 @@ jobs:
           done < <(gsutil ls -d "${DATA_ROOT}/*" 2>/dev/null || true)
 
           set +x
-          echo "Final listing (for verification):"
+          echo "Final listing:"
           gsutil ls -r "${BUCKET}/dags/"   || true
           gsutil ls -r "${BUCKET}/data/"   || true
           gsutil ls -r "${BUCKET}/config/" || true
