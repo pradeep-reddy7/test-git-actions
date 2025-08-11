@@ -16,7 +16,7 @@ jobs:
     env:
       PROJECT_ID: quick-platform-466015-d5
       GCS_BUCKET: gs://test-git-actions
-      REPO_NAME: marketing   # used under dags/: gs://bucket/dags/marketing/<subrepo>/**
+      REPO_NAME: marketing   # gs://bucket/dags/marketing/<subrepo>/**
 
     steps:
       - uses: actions/checkout@v4
@@ -53,41 +53,33 @@ jobs:
 
           echo "Bucket root: ${BUCKET}"
           base="${BUCKET#gs://}"; base="gs://${base%%/*}"
-
-          # Make the bucket existence/permission check NON-FATAL
           if ! gsutil ls -b "${base}" >/dev/null 2>&1; then
             echo "::warning::Cannot stat bucket ${base} (missing or no permission). Continuing..."
           fi
 
-          # --- Ensure mandatory top-level dirs exist (best effort) ---
+          # Ensure mandatory top-level dirs exist
           echo | gsutil cp - "${BUCKET}/dags/.gcskeep" >/dev/null 2>&1 || true
           echo | gsutil cp - "${BUCKET}/data/.gcskeep" >/dev/null 2>&1 || true
 
-          # --- Root hygiene: keep ONLY dags/, data/, config/ at bucket root ---
-          echo "Root hygiene under ${BUCKET} ..."
+          # Root hygiene: keep ONLY dags/, data/, config/
           while IFS= read -r top; do
             [[ -z "$top" ]] && continue
             base_name="${top%/}"; base_name="${base_name##*/}"
             if [[ "$base_name" != "dags" && "$base_name" != "data" && "$base_name" != "config" ]]; then
-              echo "Deleting stray top-level prefix: $top"
               gsutil -m rm -r "$top" || true
             fi
           done < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
-
-          # One-time nuke of historic leftovers
           gsutil -m rm -r "${BUCKET}/marketing" 2>/dev/null || true
           gsutil -m rm -r "${BUCKET}/Marketing" 2>/dev/null || true
 
-          # --- Optional repo-level config/ (mirror if present; else delete) ---
+          # Optional repo-level config/
           if [[ -d "config" ]]; then
-            echo "Syncing repo-level config/ -> ${CONFIG_ROOT}"
             gsutil -m rsync -d -r "config" "${CONFIG_ROOT}"
           else
-            echo "No config/ in Git — removing ${CONFIG_ROOT} if present"
             gsutil -m rm -r "${CONFIG_ROOT}" 2>/dev/null || true
           fi
 
-          # --- Discover subrepos at repo root (skip dot/infra) ---
+          # Discover subrepos at repo root (skip dot/infra)
           subrepos=()
           for d in */ ; do
             [[ -d "$d" ]] || continue
@@ -98,68 +90,35 @@ jobs:
           echo "Found subrepos: ${subrepos[*]:-<none>}"
           [[ ${#subrepos[@]} -gt 0 ]] || { echo "Nothing to sync."; exit 0; }
 
-          # --- 1) Mirror DAGs: <sub>/dags/** -> gs://.../dags/${REPO_NAME}/<sub>/** ---
+          # 1) Mirror DAGs: <sub>/dags/** -> gs://.../dags/${REPO_NAME}/<sub>/**
           for sub in "${subrepos[@]}"; do
             src="$sub/dags"
             dst="${DAGS_ROOT}/${sub}"
             if [[ -d "$src" ]]; then
-              echo "DAGs: rsync -d -r $src -> $dst"
               gsutil -m rsync -d -r "$src" "$dst"
             else
-              echo "No DAGs for $sub — deleting $dst if it exists"
               gsutil -m rm -r "$dst" 2>/dev/null || true
             fi
           done
-
-          # Prune stale DAG subrepos under gs://.../dags/${REPO_NAME}/
-          echo "Pruning stale DAGS subrepos under ${DAGS_ROOT}/ ..."
+          # Prune stale DAG subrepos
           while IFS= read -r gcs_path; do
             [[ -z "$gcs_path" ]] && continue
             gsub="${gcs_path%/}"; gsub="${gsub##*/}"
             keep=false; for sub in "${subrepos[@]}"; do [[ "$sub" == "$gsub" ]] && keep=true && break; done
-            if [[ "$keep" == false ]]; then
-              echo "Deleting stale DAGS subrepo path: $gcs_path"
-              gsutil -m rm -r "$gcs_path" || true
-            fi
+            if [[ "$keep" == false ]]; then gsutil -m rm -r "$gcs_path" || true; fi
           done < <(gsutil ls -d "${DAGS_ROOT}/*" 2>/dev/null || true)
 
-          # --- 2) Mirror DATA: every folder under each subrepo EXCEPT 'dags' ---
+          # 2) Mirror all NON-dags content with a single rsync per subrepo (deep delete)
+          #    This deletes any extra folder at ANY depth under data/<subrepo>/.
           for sub in "${subrepos[@]}"; do
-            present_folders=()
-            for dir in "$sub"/*; do
-              [[ -d "$dir" ]] || continue
-              folder="$(basename "$dir")"
-              [[ "$folder" == "dags" ]] && continue
-              present_folders+=( "$folder" )
-              src="$dir"
-              dst="${DATA_ROOT}/${sub}/${folder}/"
-              echo "DATA: rsync -d -r $src -> $dst"
-              gsutil -m rsync -d -r "$src" "$dst"
-            done
-
-            # prune any extra folders under data/<sub>/ not in Git
-            echo "Pruning stale DATA folders under ${DATA_ROOT}/${sub}/ ..."
-            while IFS= read -r gpath; do
-              [[ -z "$gpath" ]] && continue
-              gbase="${gpath%/}"; gbase="${gbase##*/}"
-              keep=false; for f in "${present_folders[@]}"; do [[ "$f" == "$gbase" ]] && keep=true && break; done
-              if [[ "$keep" == false ]]; then
-                echo "Deleting stale DATA folder: $gpath"
-                gsutil -m rm -r "$gpath" || true
-              fi
-            done < <(gsutil ls -d "${DATA_ROOT}/${sub}/*" 2>/dev/null || true)
+            gsutil -m rsync -d -r -x '(^|/)dags(/|$)' "$sub" "${DATA_ROOT}/${sub}/"
           done
-
-          # prune any extra subrepo directories under data/ not in Git
-          echo "Pruning stale DATA subrepos under ${DATA_ROOT}/ ..."
+          # Prune stale DATA subrepos not in Git
           while IFS= read -r gpath; do
             [[ -z "$gpath" ]] && continue
             gsub="${gpath%/}"; gsub="${gsub##*/}"
             keep=false; for sub in "${subrepos[@]}"; do [[ "$sub" == "$gsub" ]] && keep=true && break; done
-            if [[ "$keep" == false ]]; then
-              echo "Deleting stale DATA subrepo path: $gpath"
-              gsutil -m rm -r "$gpath" || true
-            fi
+            if [[ "$keep" == false ]]; then gsutil -m rm -r "$gpath" || true; fi
           done < <(gsutil ls -d "${DATA_ROOT}/*" 2>/dev/null || true)
 
           set +x
