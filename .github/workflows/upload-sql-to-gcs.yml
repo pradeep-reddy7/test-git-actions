@@ -1,4 +1,4 @@
-name: Mirror marketing repo to GCS
+name: Mirror marketing → GCS (Git is source of truth)
 
 on:
   workflow_dispatch:
@@ -15,7 +15,8 @@ jobs:
 
     env:
       PROJECT_ID: quick-platform-466015-d5
-      GCS_BUCKET: gs://test-git-actions
+      GCS_BUCKET: gs://test-git-actions      # bucket name
+      REPO_PREFIX: marketing                 # top-level prefix in GCS (your repo name)
 
     steps:
       - uses: actions/checkout@v4
@@ -32,68 +33,53 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
           install_components: gsutil
 
-      - name: Mirror to GCS (repo/subrepo structure)
+      - name: Mirror repo to GCS (delete extras)
         shell: bash
         run: |
           set -Eeuo pipefail
           shopt -s nullglob
 
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"              # e.g., "marketing"
-          DEST_ROOT="${GCS_BUCKET%/}/${REPO_NAME}"
-          echo "Repo: $REPO_NAME"
+          DEST_ROOT="${GCS_BUCKET%/}/${REPO_PREFIX}"
           echo "GCS root: $DEST_ROOT"
 
-          # subrepos are first-level dirs at repo root (exclude .git and .github)
+          # First-level dirs at repo root are your subrepos
           subrepos=()
           for d in */ ; do
             [[ -d "$d" ]] || continue
             base="${d%/}"
-            [[ "$base" == ".git" || "$base" == ".github" ]] && continue
+            [[ "$base" == .git || "$base" == .github || "$base" == .* ]] && continue
             subrepos+=( "$base" )
           done
-          echo "Found subrepos: ${subrepos[*]:-<none>}"
-          [[ ${#subrepos[@]} -gt 0 ]] || { echo "Nothing to sync."; exit 0; }
 
-          # 1) Sync DAGs to gs://bucket/<repo>/<sub>/dags
+          if [[ ${#subrepos[@]} -eq 0 ]]; then
+            echo "No subrepos found at repo root. Nothing to sync."
+            exit 0
+          fi
+          echo "Found subrepos: ${subrepos[*]}"
+
+          # 1) Mirror each subrepo (this copies dags/, sql/, ddl/, etc.)
           for sub in "${subrepos[@]}"; do
-            src="$sub/dags"
-            dst="$DEST_ROOT/$sub/dags"
-            if [[ -d "$src" ]]; then
-              echo "Syncing DAGs: $src -> $dst"
-              gsutil -m rsync -d -r "$src" "$dst"
-            else
-              echo "No DAGs in $sub — removing if exists: $dst"
-              gsutil -m rm -r "$dst" 2>/dev/null || true
-            fi
+            src="$sub"                       # e.g. fb_ads/
+            dst="$DEST_ROOT/$sub"            # gs://.../marketing/fb_ads
+            echo "Rsync (mirror, delete extras): $src -> $dst"
+            gsutil -m rsync -d -r "$src" "$dst"
           done
 
-          # 2) Sync every other folder under each subrepo (sql, ddl, configs, etc.)
-          for sub in "${subrepos[@]}"; do
-            for dir in "$sub"/*; do
-              [[ -d "$dir" ]] || continue
-              folder="$(basename "$dir")"
-              [[ "$folder" == "dags" ]] && continue
-              dst="$DEST_ROOT/$sub/$folder/"
-              echo "Syncing $dir -> $dst"
-              gsutil -m rsync -d -r "$dir" "$dst"
-            done
-          done
-
-          # 3) Clean stale subrepo roots in GCS (if a subrepo folder was deleted in Git)
-          echo "Cleaning stale subrepos under $DEST_ROOT/ ..."
+          # 2) Delete any top-level entries under marketing/ not in Git
+          echo "Cleaning stale entries under $DEST_ROOT/ ..."
           while IFS= read -r gcs_path; do
             [[ -n "$gcs_path" ]] || continue
-            gsub="$(echo "$gcs_path" | sed 's:/*$::' | awk -F/ '{print $NF}')"
+            base="$(echo "$gcs_path" | sed 's:/*$::' | awk -F/ '{print $NF}')"
             keep=false
             for sub in "${subrepos[@]}"; do
-              if [[ "$sub" == "$gsub" ]]; then keep=true; break; fi
+              [[ "$sub" == "$base" ]] && keep=true && break
             done
             if [[ "$keep" == false ]]; then
-              echo "Deleting stale subrepo path: $gcs_path"
+              echo "Deleting stale path: $gcs_path"
               gsutil -m rm -r "$gcs_path" || true
             fi
           done < <(gsutil ls -d "$DEST_ROOT/"* 2>/dev/null || true)
 
           echo "Final listing:"
           gsutil ls -r "$DEST_ROOT/" || true
-          echo "✅ Done."
+          echo "✅ Mirror complete."
