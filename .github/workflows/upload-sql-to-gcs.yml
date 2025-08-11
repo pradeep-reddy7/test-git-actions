@@ -33,27 +33,35 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
           install_components: gsutil
 
+      - name: Quick repo view (debug)
+        run: |
+          echo "Repo top-level folders:"
+          find . -maxdepth 2 -type d -printf "%P\n" | sed 's#^$#.#/' | sort
+
       - name: Mirror to GCS (delete extras)
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          set -x
+          trap 'echo "::error::Failed at line $LINENO: $BASH_COMMAND"' ERR
+
           shopt -s nullglob
 
           BUCKET="${GCS_BUCKET%/}"
-          DAGS_ROOT="$BUCKET/dags/${REPO_NAME}"
-          DATA_ROOT="$BUCKET/data"
-          CONFIG_ROOT="$BUCKET/config"
+          DAGS_ROOT="${BUCKET}/dags/${REPO_NAME}"
+          DATA_ROOT="${BUCKET}/data"
+          CONFIG_ROOT="${BUCKET}/config"
 
-          echo "Bucket root: $BUCKET"
+          echo "Bucket root: ${BUCKET}"
           base="${BUCKET#gs://}"; base="gs://${base%%/*}"
-          gsutil ls -b "$base" >/dev/null
+          gsutil ls -b "${base}" >/dev/null
 
           # --- Ensure mandatory top-level dirs exist ---
           echo | gsutil cp - "${BUCKET}/dags/.gcskeep" >/dev/null 2>&1 || true
           echo | gsutil cp - "${BUCKET}/data/.gcskeep" >/dev/null 2>&1 || true
 
           # --- Root hygiene: keep ONLY dags/, data/, config/ at bucket root ---
-          echo "Root hygiene: pruning unexpected top-level prefixes under $BUCKET ..."
+          echo "Root hygiene: pruning unexpected top-level prefixes under ${BUCKET} ..."
           while IFS= read -r top; do
             [[ -z "$top" ]] && continue
             base_name="${top%/}"; base_name="${base_name##*/}"
@@ -61,15 +69,19 @@ jobs:
               echo "Deleting stray top-level prefix: $top"
               gsutil -m rm -r "$top" || true
             fi
-          done < <(gsutil ls -d "$BUCKET/"* 2>/dev/null || true)
+          done < <(gsutil ls -d "${BUCKET}/*" 2>/dev/null || true)
+
+          # Extra one-time nuke of old leftovers named marketing/ or Marketing/ at root
+          gsutil -m rm -r "${BUCKET}/marketing" 2>/dev/null || true
+          gsutil -m rm -r "${BUCKET}/Marketing" 2>/dev/null || true
 
           # --- Optional repo-level config/ (mirror if present; else delete) ---
           if [[ -d "config" ]]; then
-            echo "Syncing repo-level config/ -> $CONFIG_ROOT"
-            gsutil -m rsync -d -r "config" "$CONFIG_ROOT"
+            echo "Syncing repo-level config/ -> ${CONFIG_ROOT}"
+            gsutil -m rsync -d -r "config" "${CONFIG_ROOT}"
           else
-            echo "No config/ in Git — removing $CONFIG_ROOT if present"
-            gsutil -m rm -r "$CONFIG_ROOT" 2>/dev/null || true
+            echo "No config/ in Git — removing ${CONFIG_ROOT} if present"
+            gsutil -m rm -r "${CONFIG_ROOT}" 2>/dev/null || true
           fi
 
           # --- Discover subrepos at repo root (skip dot/infra) ---
@@ -86,7 +98,7 @@ jobs:
           # --- 1) Mirror DAGs: <sub>/dags/** -> gs://.../dags/${REPO_NAME}/<sub>/** ---
           for sub in "${subrepos[@]}"; do
             src="$sub/dags"
-            dst="$DAGS_ROOT/$sub"
+            dst="${DAGS_ROOT}/${sub}"
             if [[ -d "$src" ]]; then
               echo "DAGs: rsync -d -r $src -> $dst"
               gsutil -m rsync -d -r "$src" "$dst"
@@ -97,7 +109,7 @@ jobs:
           done
 
           # Prune stale DAG subrepos under gs://.../dags/${REPO_NAME}/
-          echo "Pruning stale DAGS subrepos under $DAGS_ROOT/ ..."
+          echo "Pruning stale DAGS subrepos under ${DAGS_ROOT}/ ..."
           while IFS= read -r gcs_path; do
             [[ -z "$gcs_path" ]] && continue
             gsub="${gcs_path%/}"; gsub="${gsub##*/}"
@@ -106,7 +118,7 @@ jobs:
               echo "Deleting stale DAGS subrepo path: $gcs_path"
               gsutil -m rm -r "$gcs_path" || true
             fi
-          done < <(gsutil ls -d "$DAGS_ROOT/"* 2>/dev/null || true)
+          done < <(gsutil ls -d "${DAGS_ROOT}/*" 2>/dev/null || true)
 
           # --- 2) Mirror DATA: every folder under each subrepo EXCEPT 'dags' ---
           for sub in "${subrepos[@]}"; do
@@ -117,13 +129,13 @@ jobs:
               [[ "$folder" == "dags" ]] && continue
               present_folders+=( "$folder" )
               src="$dir"
-              dst="$DATA_ROOT/$sub/$folder/"
+              dst="${DATA_ROOT}/${sub}/${folder}/"
               echo "DATA: rsync -d -r $src -> $dst"
               gsutil -m rsync -d -r "$src" "$dst"
             done
 
             # prune any extra folders under data/<sub>/ not in Git
-            echo "Pruning stale DATA folders under $DATA_ROOT/$sub/ ..."
+            echo "Pruning stale DATA folders under ${DATA_ROOT}/${sub}/ ..."
             while IFS= read -r gpath; do
               [[ -z "$gpath" ]] && continue
               gbase="${gpath%/}"; gbase="${gbase##*/}"
@@ -132,11 +144,11 @@ jobs:
                 echo "Deleting stale DATA folder: $gpath"
                 gsutil -m rm -r "$gpath" || true
               fi
-            done < <(gsutil ls -d "$DATA_ROOT/$sub/"* 2>/dev/null || true)
+            done < <(gsutil ls -d "${DATA_ROOT}/${sub}/*" 2>/dev/null || true)
           done
 
           # prune any extra subrepo directories under data/ not in Git
-          echo "Pruning stale DATA subrepos under $DATA_ROOT/ ..."
+          echo "Pruning stale DATA subrepos under ${DATA_ROOT}/ ..."
           while IFS= read -r gpath; do
             [[ -z "$gpath" ]] && continue
             gsub="${gpath%/}"; gsub="${gsub##*/}"
@@ -145,10 +157,11 @@ jobs:
               echo "Deleting stale DATA subrepo path: $gpath"
               gsutil -m rm -r "$gpath" || true
             fi
-          done < <(gsutil ls -d "$DATA_ROOT/"* 2>/dev/null || true)
+          done < <(gsutil ls -d "${DATA_ROOT}/*" 2>/dev/null || true)
 
-          echo "Final listing:"
-          gsutil ls -r "$BUCKET/dags/"   || true
-          gsutil ls -r "$BUCKET/data/"   || true
-          gsutil ls -r "$BUCKET/config/" || true
+          set +x
+          echo "Final listing (for verification):"
+          gsutil ls -r "${BUCKET}/dags/"   || true
+          gsutil ls -r "${BUCKET}/data/"   || true
+          gsutil ls -r "${BUCKET}/config/" || true
           echo "✅ Mirror complete."
