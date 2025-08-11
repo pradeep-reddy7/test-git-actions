@@ -16,7 +16,7 @@ jobs:
     env:
       PROJECT_ID: quick-platform-466015-d5
       GCS_BUCKET: gs://test-git-actions
-      REPO_NAME: marketing            # used only in the DAGS path under gs://.../dags/<REPO_NAME>/<subrepo>
+      REPO_NAME: marketing   # used in the DAGS path: gs://bucket/dags/marketing/<subrepo>/**
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
           install_components: gsutil
 
-      - name: Mirror to GCS
+      - name: Mirror to GCS (delete extras)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -44,101 +44,4 @@ jobs:
           DATA_ROOT="$BUCKET/data"
           CONFIG_ROOT="$BUCKET/config"
 
-          echo "Bucket: $BUCKET"
-          echo "DAGS_ROOT:   $DAGS_ROOT"
-          echo "DATA_ROOT:   $DATA_ROOT"
-          echo "CONFIG_ROOT: $CONFIG_ROOT"
-
-          # --- Ensure mandatory top-level folders exist (via .gcskeep) ---
-          echo | gsutil cp - "${BUCKET}/dags/.gcskeep"   >/dev/null 2>&1 || true
-          echo | gsutil cp - "${BUCKET}/data/.gcskeep"   >/dev/null 2>&1 || true
-
-          # --- Handle repo-level config/ (mirror if exists, delete if not) ---
-          if [[ -d "config" ]]; then
-            echo "Syncing repo-level config/ -> $CONFIG_ROOT"
-            gsutil -m rsync -d -r "config" "$CONFIG_ROOT"
-          else
-            echo "No config/ in Git — removing $CONFIG_ROOT if present"
-            gsutil -m rm -r "$CONFIG_ROOT" 2>/dev/null || true
-          fi
-
-          # --- Identify subrepos: first-level folders (skip dot/infra) ---
-          subrepos=()
-          for d in */ ; do
-            [[ -d "$d" ]] || continue
-            base="${d%/}"
-            [[ "$base" == .git || "$base" == .github || "$base" == config || "$base" == .* ]] && continue
-            subrepos+=( "$base" )
-          done
-          echo "Found subrepos: ${subrepos[*]:-<none>}"
-          [[ ${#subrepos[@]} -gt 0 ]] || { echo "Nothing to sync."; exit 0; }
-
-          # --- 1) Mirror DAGs (src: <sub>/dags/**  → dst: gs://.../dags/marketing/<sub>/**) ---
-          for sub in "${subrepos[@]}"; do
-            src="$sub/dags"
-            dst="$DAGS_ROOT/$sub"
-            if [[ -d "$src" ]]; then
-              echo "DAGs: rsync -d -r $src -> $dst"
-              gsutil -m rsync -d -r "$src" "$dst"
-            else
-              echo "No DAGs for $sub — deleting $dst if it exists"
-              gsutil -m rm -r "$dst" 2>/dev/null || true
-            fi
-          done
-
-          # Clean stale subrepo dirs under DAGS_ROOT not present in Git
-          echo "Pruning stale DAGS subrepos under $DAGS_ROOT/ ..."
-          while IFS= read -r gcs_path; do
-            [[ -n "$gcs_path" ]] || continue
-            gsub="$(echo "$gcs_path" | sed 's:/*$::' | awk -F/ '{print $NF}')"
-            keep=false; for sub in "${subrepos[@]}"; do [[ "$sub" == "$gsub" ]] && keep=true && break; done
-            if [[ "$keep" == false ]]; then
-              echo "Deleting stale DAGS subrepo path: $gcs_path"
-              gsutil -m rm -r "$gcs_path" || true
-            fi
-          done < <(gsutil ls -d "$DAGS_ROOT/"* 2>/dev/null || true)
-
-          # --- 2) Mirror DATA (everything except dags/) ---
-          for sub in "${subrepos[@]}"; do
-            present_folders=()
-            for dir in "$sub"/*; do
-              [[ -d "$dir" ]] || continue
-              folder="$(basename "$dir")"
-              [[ "$folder" == "dags" ]] && continue
-              present_folders+=( "$folder" )
-              src="$dir"
-              dst="$DATA_ROOT/$sub/$folder/"
-              echo "DATA: rsync -d -r $src -> $dst"
-              gsutil -m rsync -d -r "$src" "$dst"
-            done
-
-            # prune any extra folders under data/<sub>/ that aren't in Git
-            echo "Pruning stale DATA folders under $DATA_ROOT/$sub/ ..."
-            while IFS= read -r gpath; do
-              [[ -n "$gpath" ]] || continue
-              gbase="$(echo "$gpath" | sed 's:/*$::' | awk -F/ '{print $NF}')"
-              keep=false; for f in "${present_folders[@]}"; do [[ "$f" == "$gbase" ]] && keep=true && break; done
-              if [[ "$keep" == false ]]; then
-                echo "Deleting stale DATA folder: $gpath"
-                gsutil -m rm -r "$gpath" || true
-              fi
-            done < <(gsutil ls -d "$DATA_ROOT/$sub/"* 2>/dev/null || true)
-          done
-
-          # prune any extra subrepos at data root not in Git
-          echo "Pruning stale DATA subrepos under $DATA_ROOT/ ..."
-          while IFS= read -r gpath; do
-            [[ -n "$gpath" ]] || continue
-            gsub="$(echo "$gpath" | sed 's:/*$::' | awk -F/ '{print $NF}')"
-            keep=false; for sub in "${subrepos[@]}"; do [[ "$sub" == "$gsub" ]] && keep=true && break; done
-            if [[ "$keep" == false ]]; then
-              echo "Deleting stale DATA subrepo path: $gpath"
-              gsutil -m rm -r "$gpath" || true
-            fi
-          done < <(gsutil ls -d "$DATA_ROOT/"* 2>/dev/null || true)
-
-          echo "Final listing:"
-          gsutil ls -r "$BUCKET/dags/"   || true
-          gsutil ls -r "$BUCKET/data/"   || true
-          gsutil ls -r "$BUCKET/config/" || true
-          echo "✅ Mirror complete."
+          echo "Bucket root: $BUCKET"
