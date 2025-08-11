@@ -6,7 +6,7 @@ on:
     branches: ["**"]
     paths:
       - ".github/workflows/upload-sql-to-gcs.yml"
-      - "test-git-hub-actions/marketing/**"
+      - "marketing/**"
 
 jobs:
   sync:
@@ -16,31 +16,24 @@ jobs:
 
     env:
       PROJECT_ID: quick-platform-466015-d5
-      BUCKET: gs://quick-platform-466015-d5/test-git-actions
-      REPO_ROOT: test-git-hub-actions/marketing
+      GCS_BUCKET: gs://test-git-actions
+      REPO_ROOT: marketing
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ✅ Authenticate using a JSON key stored in Actions Secret GCP_SA_KEY
       - name: Auth to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # ✅ Install gcloud + gsutil
       - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
           install_components: gsutil
-
-      - name: Verify gsutil
-        run: |
-          gcloud --version
-          gsutil --version
 
       - name: Sync DAGs and data to GCS
         shell: bash
@@ -48,11 +41,10 @@ jobs:
           set -Eeuo pipefail
           shopt -s nullglob
 
-          echo "Using PROJECT_ID=${PROJECT_ID}"
-          echo "Using BUCKET=${BUCKET}"
-          echo "Using REPO_ROOT=${REPO_ROOT}"
+          DEST="${GCS_BUCKET%/}"
+          echo "Destination root: $DEST"
 
-          # Collect subrepos under REPO_ROOT
+          # collect subrepos under marketing/
           subrepos=()
           for d in "$REPO_ROOT"/*; do
             [[ -d "$d" ]] || continue
@@ -60,62 +52,61 @@ jobs:
           done
           echo "Found subrepos: ${subrepos[*]:-<none>}"
 
-          # 1) Sync DAGs (mirror)
+          # --- Sync DAGs ---
           for sub in "${subrepos[@]}"; do
             src="$REPO_ROOT/$sub/dags"
-            dst="$BUCKET/dags/$REPO_ROOT/$sub/dags"
+            dst="$DEST/dags/$REPO_ROOT/$sub/dags"
             if [[ -d "$src" ]]; then
               echo "Syncing DAGs: $src -> $dst"
               gsutil -m rsync -d -r "$src" "$dst"
             else
-              echo "No DAGs in $REPO_ROOT/$sub — removing GCS dags path if present: $dst"
+              echo "No DAGs in $REPO_ROOT/$sub — removing GCS path if present: $dst"
               gsutil -m rm -r "$dst" 2>/dev/null || true
             fi
           done
 
-          # Remove stale subfolders in GCS DAGs not present in Git
-          echo "Cleaning stale GCS DAGs under $BUCKET/dags/$REPO_ROOT ..."
+          # Remove stale DAG folders in GCS
+          echo "Cleaning stale GCS DAGs under $DEST/dags/$REPO_ROOT ..."
           while IFS= read -r gcs_path; do
             [[ -n "$gcs_path" ]] || continue
-            # example: gs://.../dags/test-git-hub-actions/marketing/<sub>/dags
             gcs_sub=$(echo "$gcs_path" | sed 's:/*$::' | awk -F/ '{print $(NF-1)}')
             keep=false
             for sub in "${subrepos[@]}"; do
-              if [[ "$sub" == "$gcs_sub" ]]; then keep=true; break; fi
+              [[ "$sub" == "$gcs_sub" ]] && keep=true && break
             done
             if [[ "$keep" == false ]]; then
               echo "Deleting stale DAGs path: $gcs_path"
               gsutil -m rm -r "$gcs_path" || true
             fi
-          done < <(gsutil ls -d "$BUCKET/dags/$REPO_ROOT/"*"/dags" 2>/dev/null || true)
+          done < <(gsutil ls -d "$DEST/dags/$REPO_ROOT/"*"/dags" 2>/dev/null || true)
 
-          # 2) Sync other folders (everything except DAGs)
+          # --- Sync other folders (sql/, ddl/, configs/, etc.) ---
           for sub in "${subrepos[@]}"; do
             for dir in "$REPO_ROOT/$sub"/*; do
               [[ -d "$dir" ]] || continue
               folder=$(basename "$dir")
-              if [[ "$folder" != "dags" ]]; then
-                dst="$BUCKET/data/$REPO_ROOT/$sub/$folder/"
-                echo "Syncing $dir -> $dst"
-                gsutil -m rsync -d -r "$dir" "$dst"
-              fi
+              [[ "$folder" == "dags" ]] && continue
+              dst="$DEST/data/$REPO_ROOT/$sub/$folder/"
+              echo "Syncing $dir -> $dst"
+              gsutil -m rsync -d -r "$dir" "$dst"
             done
           done
 
-          # Remove stale top-level subrepo folders in GCS data not present in Git
-          echo "Cleaning stale GCS data under $BUCKET/data/$REPO_ROOT ..."
+          # Remove stale data folders in GCS
+          echo "Cleaning stale GCS data under $DEST/data/$REPO_ROOT ..."
           while IFS= read -r gcs_path; do
             [[ -n "$gcs_path" ]] || continue
-            # example: gs://.../data/test-git-hub-actions/marketing/<sub>/
             gcs_sub=$(echo "$gcs_path" | sed 's:/*$::' | awk -F/ '{print $NF}')
             keep=false
             for sub in "${subrepos[@]}"; do
-              if [[ "$sub" == "$gcs_sub" ]]; then keep=true; break; fi
+              [[ "$sub" == "$gcs_sub" ]] && keep=true && break
             done
             if [[ "$keep" == false ]]; then
               echo "Deleting stale data path: $gcs_path"
               gsutil -m rm -r "$gcs_path" || true
             fi
-          done < <(gsutil ls -d "$BUCKET/data/$REPO_ROOT/"* 2>/dev/null || true)
+          done < <(gsutil ls -d "$DEST/data/$REPO_ROOT/"* 2>/dev/null || true)
 
+          echo "Final GCS listing:"
+          gsutil ls -r "$DEST/" || true
           echo "✅ Sync complete."
