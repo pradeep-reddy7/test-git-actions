@@ -3,11 +3,10 @@ name: Upload Marketing to GCS
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "**"
+    branches: ["**"]
     paths:
-      - '.github/workflows/upload-sql-to-gcs.yml'
-      - 'test-git-hub-actions/marketing/**'
+      - ".github/workflows/upload-sql-to-gcs.yml"
+      - "test-git-hub-actions/marketing/**"
 
 jobs:
   sync:
@@ -17,7 +16,6 @@ jobs:
 
     env:
       PROJECT_ID: quick-platform-466015-d5
-      # Make sure this bucket actually exists and the SA has access to it:
       BUCKET: gs://quick-platform-466015-d5/test-git-actions
       REPO_ROOT: test-git-hub-actions/marketing
 
@@ -25,23 +23,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Auth with a service account JSON stored in GitHub Secret GCP_SA_KEY
-      - name: Auth & setup gcloud
+      # ✅ Authenticate using a JSON key stored in Actions Secret GCP_SA_KEY
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # ✅ Install gcloud + gsutil
+      - name: Setup gcloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          export_default_credentials: true
+          install_components: gsutil
 
-      - name: Verify gsutil & bucket
-        shell: bash
+      - name: Verify gsutil
         run: |
-          set -euo pipefail
+          gcloud --version
           gsutil --version
-          # Validate the bucket base (everything before the first / after gs://)
-          base="${BUCKET#gs://}"; base="gs://${base%%/*}"
-          echo "Checking bucket base: $base"
-          gsutil ls -b "$base" >/dev/null
 
       - name: Sync DAGs and data to GCS
         shell: bash
@@ -97,3 +96,26 @@ jobs:
               folder=$(basename "$dir")
               if [[ "$folder" != "dags" ]]; then
                 dst="$BUCKET/data/$REPO_ROOT/$sub/$folder/"
+                echo "Syncing $dir -> $dst"
+                gsutil -m rsync -d -r "$dir" "$dst"
+              fi
+            done
+          done
+
+          # Remove stale top-level subrepo folders in GCS data not present in Git
+          echo "Cleaning stale GCS data under $BUCKET/data/$REPO_ROOT ..."
+          while IFS= read -r gcs_path; do
+            [[ -n "$gcs_path" ]] || continue
+            # example: gs://.../data/test-git-hub-actions/marketing/<sub>/
+            gcs_sub=$(echo "$gcs_path" | sed 's:/*$::' | awk -F/ '{print $NF}')
+            keep=false
+            for sub in "${subrepos[@]}"; do
+              if [[ "$sub" == "$gcs_sub" ]]; then keep=true; break; fi
+            done
+            if [[ "$keep" == false ]]; then
+              echo "Deleting stale data path: $gcs_path"
+              gsutil -m rm -r "$gcs_path" || true
+            fi
+          done < <(gsutil ls -d "$BUCKET/data/$REPO_ROOT/"* 2>/dev/null || true)
+
+          echo "✅ Sync complete."
